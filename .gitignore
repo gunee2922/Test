@@ -1,5 +1,9 @@
-# Test files
+# Test files and sample data
 test_eos_enhanced.py
+verify_eos_enhanced.py
+create_sample_data.py
+sample_*.xlsx
+README_ENHANCED.md
 
 # Python cache
 __pycache__/
