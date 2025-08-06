@@ -5,8 +5,383 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from scipy.optimize import root_scalar, curve_fit
 import matplotlib.gridspec as gridspec
+import warnings
+from collections import defaultdict
 
 # EOS functions
+
+def smart_pressure_sort(P_data, *args):
+    """
+    Smart pressure sorting for non-sequential pressure data.
+    Sorts pressure data and corresponding arrays while maintaining relationships.
+    
+    Args:
+        P_data: pressure array
+        *args: additional arrays (V, sigma_P, sigma_V, etc.) to sort in same order
+    
+    Returns:
+        tuple: (sorted_P, sorted_arg1, sorted_arg2, ...)
+    """
+    if len(P_data) == 0:
+        return tuple([np.array([]) for _ in range(len(args) + 1)])
+    
+    # Get sorting indices
+    sort_indices = np.argsort(P_data)
+    
+    # Sort pressure and all associated arrays
+    sorted_arrays = [P_data[sort_indices]]
+    for arr in args:
+        if arr is not None and len(arr) == len(P_data):
+            sorted_arrays.append(arr[sort_indices])
+        else:
+            sorted_arrays.append(arr)
+    
+    return tuple(sorted_arrays)
+
+def apply_physical_constraints(params, eos_type='Birch-Murnaghan'):
+    """
+    Apply physical constraints to EOS parameters.
+    
+    Args:
+        params: list/array of [V0, K0, Kp] parameters
+        eos_type: type of EOS equation
+    
+    Returns:
+        constrained parameters
+    """
+    V0, K0, Kp = params
+    
+    # Physical constraints
+    V0 = max(V0, 1.0)      # V0 should be positive and reasonable
+    K0 = max(K0, 1.0)      # K0 should be positive
+    K0 = min(K0, 1000.0)   # K0 shouldn't be unreasonably large
+    
+    if eos_type == 'Birch-Murnaghan':
+        Kp = max(Kp, 0.5)  # K' should be positive for BM
+        Kp = min(Kp, 10.0) # K' typically between 0.5-10
+    else:  # Vinet
+        Kp = max(Kp, 0.5)
+        Kp = min(Kp, 12.0)
+    
+    return [V0, K0, Kp]
+
+def adaptive_bracket_selection(eos_func, pressure, V0_guess, K0_guess, Kp_guess, bracket_factor=0.1):
+    """
+    Adaptive bracket selection for safe volume calculation.
+    
+    Args:
+        eos_func: EOS function
+        pressure: target pressure
+        V0_guess, K0_guess, Kp_guess: EOS parameters
+        bracket_factor: factor for bracket adjustment
+    
+    Returns:
+        tuple: (lower_bound, upper_bound) for root finding
+    """
+    try:
+        # Start with standard brackets
+        lower = V0_guess * (0.3 - bracket_factor)
+        upper = V0_guess * (1.2 + bracket_factor)
+        
+        # Check if brackets have different signs
+        f_lower = eos_func(lower, V0_guess, K0_guess, Kp_guess) - pressure
+        f_upper = eos_func(upper, V0_guess, K0_guess, Kp_guess) - pressure
+        
+        # If same sign, expand brackets
+        iteration = 0
+        max_iterations = 10
+        
+        while f_lower * f_upper > 0 and iteration < max_iterations:
+            if abs(f_lower) < abs(f_upper):
+                lower *= 0.8
+            else:
+                upper *= 1.2
+            
+            f_lower = eos_func(lower, V0_guess, K0_guess, Kp_guess) - pressure
+            f_upper = eos_func(upper, V0_guess, K0_guess, Kp_guess) - pressure
+            iteration += 1
+        
+        # Ensure reasonable bounds
+        lower = max(lower, V0_guess * 0.1)  # Not too small
+        upper = min(upper, V0_guess * 2.0)  # Not too large
+        
+        return lower, upper
+    
+    except:
+        # Fallback to conservative brackets
+        return V0_guess * 0.3, V0_guess * 1.2
+
+def safe_volume_calculation(eos_func, pressure, V0, K0, Kp, max_attempts=3):
+    """
+    Safe volume calculation with multiple fallback strategies.
+    
+    Args:
+        eos_func: EOS function (birch_murnaghan_P or vinet_P)
+        pressure: target pressure
+        V0, K0, Kp: EOS parameters
+        max_attempts: maximum number of attempts with different strategies
+    
+    Returns:
+        dict: {'volume': calculated_volume, 'success': True/False, 'method': method_used}
+    """
+    for attempt in range(max_attempts):
+        try:
+            # Apply physical constraints
+            V0_c, K0_c, Kp_c = apply_physical_constraints([V0, K0, Kp])
+            
+            # Get adaptive brackets
+            lower, upper = adaptive_bracket_selection(eos_func, pressure, V0_c, K0_c, Kp_c, 
+                                                    bracket_factor=attempt * 0.05)
+            
+            # Try root finding
+            sol = root_scalar(
+                lambda V: eos_func(V, V0_c, K0_c, Kp_c) - pressure,
+                bracket=[lower, upper],
+                method='brentq',  # More robust than bisect
+                xtol=1e-12,
+                rtol=1e-10
+            )
+            
+            if sol.converged and sol.root > 0:
+                return {
+                    'volume': sol.root,
+                    'success': True,
+                    'method': f'brentq_attempt_{attempt+1}'
+                }
+        
+        except Exception as e:
+            # Try with different method or parameters
+            if attempt < max_attempts - 1:
+                continue
+            else:
+                # Last attempt: try with very conservative brackets
+                try:
+                    conservative_lower = V0 * 0.5
+                    conservative_upper = V0 * 1.1
+                    
+                    sol = root_scalar(
+                        lambda V: eos_func(V, V0, K0, Kp) - pressure,
+                        bracket=[conservative_lower, conservative_upper],
+                        method='bisect'
+                    )
+                    
+                    return {
+                        'volume': sol.root,
+                        'success': True,
+                        'method': 'conservative_bisect'
+                    }
+                except:
+                    # Final fallback: linear approximation
+                    try:
+                        V_approx = V0 * (1 - pressure / (3 * K0))  # Simple linear approximation
+                        return {
+                            'volume': max(V_approx, V0 * 0.1),
+                            'success': False,
+                            'method': 'linear_approximation'
+                        }
+                    except:
+                        return {
+                            'volume': V0 * 0.9,
+                            'success': False,
+                            'method': 'fallback_default'
+                        }
+
+def robust_eos_fitting(V_data, P_data, sigma_P=None, eos_type='Birch-Murnaghan', 
+                      max_iterations=10, tolerance=1e-8):
+    """
+    Robust EOS fitting with multiple initial guesses and optimization strategies.
+    
+    Args:
+        V_data, P_data: volume and pressure data
+        sigma_P: pressure uncertainties
+        eos_type: 'Birch-Murnaghan' or 'Vinet'
+        max_iterations: maximum number of fitting attempts
+        tolerance: convergence tolerance
+    
+    Returns:
+        dict: fitting results with best parameters, errors, and quality metrics
+    """
+    # Sort data by pressure
+    sorted_data = smart_pressure_sort(P_data, V_data, sigma_P if sigma_P is not None else None)
+    P_sorted, V_sorted = sorted_data[0], sorted_data[1]
+    sigma_P_sorted = sorted_data[2] if sigma_P is not None else None
+    
+    # Choose EOS function
+    if eos_type == 'Birch-Murnaghan':
+        eos_func = birch_murnaghan_P
+        fit_func = birch_murnaghan_fit_func
+    else:
+        eos_func = vinet_P
+        fit_func = vinet_fit_func
+    
+    # Generate multiple initial guesses
+    V0_guesses = [V_sorted.max(), V_sorted.max() * 1.05, V_sorted.max() * 0.95]
+    K0_guesses = [100, 150, 200, 250]  # Range of typical bulk moduli
+    Kp_guesses = [3.5, 4.0, 4.5, 5.0]  # Range of typical K'
+    
+    best_result = None
+    best_chisq = np.inf
+    all_attempts = []
+    
+    for V0_guess in V0_guesses:
+        for K0_guess in K0_guesses:
+            for Kp_guess in Kp_guesses:
+                try:
+                    # Apply constraints to initial guess
+                    initial_guess = apply_physical_constraints([V0_guess, K0_guess, Kp_guess], eos_type)
+                    
+                    # Perform fitting
+                    if sigma_P_sorted is not None:
+                        popt, pcov = curve_fit(
+                            fit_func, V_sorted, P_sorted,
+                            p0=initial_guess,
+                            sigma=sigma_P_sorted,
+                            absolute_sigma=True,
+                            maxfev=5000
+                        )
+                    else:
+                        popt, pcov = curve_fit(
+                            fit_func, V_sorted, P_sorted,
+                            p0=initial_guess,
+                            maxfev=5000
+                        )
+                    
+                    # Apply constraints to fitted parameters
+                    popt = apply_physical_constraints(popt, eos_type)
+                    
+                    # Calculate parameter errors
+                    perr = np.sqrt(np.diag(pcov))
+                    
+                    # Calculate quality metrics
+                    P_pred = eos_func(V_sorted, *popt)
+                    residuals = P_sorted - P_pred
+                    
+                    # R-squared
+                    ss_res = np.sum(residuals**2)
+                    ss_tot = np.sum((P_sorted - np.mean(P_sorted))**2)
+                    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                    
+                    # Chi-squared
+                    if sigma_P_sorted is not None:
+                        chi_squared = np.sum((residuals / sigma_P_sorted)**2)
+                        reduced_chi_squared = chi_squared / (len(P_sorted) - 3)  # 3 parameters
+                    else:
+                        chi_squared = ss_res
+                        reduced_chi_squared = chi_squared / (len(P_sorted) - 3)
+                    
+                    # RMS error
+                    rms_error = np.sqrt(np.mean(residuals**2))
+                    
+                    result = {
+                        'params': popt,
+                        'errors': perr,
+                        'covariance': pcov,
+                        'r_squared': r_squared,
+                        'chi_squared': chi_squared,
+                        'reduced_chi_squared': reduced_chi_squared,
+                        'rms_error': rms_error,
+                        'residuals': residuals,
+                        'initial_guess': initial_guess,
+                        'n_points': len(P_sorted)
+                    }
+                    
+                    all_attempts.append(result)
+                    
+                    # Check if this is the best fit so far
+                    if reduced_chi_squared < best_chisq:
+                        best_chisq = reduced_chi_squared
+                        best_result = result
+                
+                except Exception as e:
+                    # Log failed attempt but continue
+                    all_attempts.append({
+                        'failed': True,
+                        'error': str(e),
+                        'initial_guess': [V0_guess, K0_guess, Kp_guess]
+                    })
+                    continue
+    
+    if best_result is None:
+        raise RuntimeError("All fitting attempts failed")
+    
+    # Add metadata about fitting process
+    best_result['fitting_attempts'] = len(all_attempts)
+    best_result['successful_attempts'] = len([a for a in all_attempts if 'failed' not in a])
+    best_result['eos_type'] = eos_type
+    
+    return best_result
+
+def extrapolate_to_zero_pressure(eos_func, params, max_volume_factor=1.5):
+    """
+    Extrapolate EOS to zero pressure to find V0.
+    
+    Args:
+        eos_func: EOS function
+        params: [V0, K0, Kp] parameters
+        max_volume_factor: maximum factor for volume search
+    
+    Returns:
+        V0 at P=0
+    """
+    V0, K0, Kp = params
+    
+    try:
+        # Find volume at P=0
+        result = safe_volume_calculation(eos_func, 0.0, V0, K0, Kp)
+        if result['success']:
+            return result['volume']
+        else:
+            # Fallback: use fitted V0 parameter
+            return V0
+    except:
+        return V0
+
+def calculate_quality_metrics(P_data, P_predicted, sigma_P=None, n_params=3):
+    """
+    Calculate quality metrics for EOS fitting.
+    
+    Args:
+        P_data: observed pressure data
+        P_predicted: predicted pressure from EOS
+        sigma_P: pressure uncertainties
+        n_params: number of fitted parameters
+    
+    Returns:
+        dict: quality metrics (R², χ², RMS, etc.)
+    """
+    residuals = P_data - P_predicted
+    
+    # R-squared
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((P_data - np.mean(P_data))**2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    
+    # Chi-squared
+    if sigma_P is not None:
+        chi_squared = np.sum((residuals / sigma_P)**2)
+        reduced_chi_squared = chi_squared / (len(P_data) - n_params)
+    else:
+        chi_squared = ss_res
+        reduced_chi_squared = chi_squared / (len(P_data) - n_params)
+    
+    # RMS error
+    rms_error = np.sqrt(np.mean(residuals**2))
+    
+    # Mean absolute error
+    mae = np.mean(np.abs(residuals))
+    
+    # Maximum absolute error
+    max_abs_error = np.max(np.abs(residuals))
+    
+    return {
+        'r_squared': r_squared,
+        'chi_squared': chi_squared,
+        'reduced_chi_squared': reduced_chi_squared,
+        'rms_error': rms_error,
+        'mae': mae,
+        'max_abs_error': max_abs_error,
+        'residuals': residuals
+    }
 
 def birch_murnaghan_axial(P, L0, M0, Mp, Mpp=0.0, use_mpp=False):
     x = P / M0
@@ -146,12 +521,18 @@ def calculate_dspacing(h, k, l, lattice_params, crystal_system):
 class EOSPlotApp:
     def __init__(self, master):
         self.master = master
-        master.title("EOS Plotting Tool")
+        master.title("EOS Plotting Tool - Enhanced Version")
         
         # Set initial window size and make it resizable
         master.geometry("1400x900")  # 충분히 큰 초기 크기
         master.minsize(1200, 700)   # 최소 크기 설정
         master.state('normal')      # 정상 창 모드
+        
+        # Enhanced data storage for separated import system
+        self.eos_data = {}  # Main curve fitting data
+        self.error_data = {}  # Error band calculation data
+        self.fitting_status = {}  # Real-time fitting status
+        self.quality_metrics = {}  # Quality metrics storage
         
         # Monte Carlo 결과 저장용
         self.mc_results = {}
@@ -168,6 +549,176 @@ class EOSPlotApp:
         self.volume_frame = ttk.Frame(self.notebook)
         self.setup_volume_ui()
         self.notebook.add(self.volume_frame, text='Volume/Density EOS')
+
+    def update_fitting_status(self, curve_name, status_text, metrics=None, color="black"):
+        """
+        Update fitting status with real-time quality metrics display.
+        
+        Args:
+            curve_name: name of the curve being fitted
+            status_text: status message
+            metrics: dict of quality metrics (R², χ², etc.)
+            color: text color for status
+        """
+        # Store status
+        self.fitting_status[curve_name] = {
+            'status': status_text,
+            'timestamp': pd.Timestamp.now(),
+            'color': color
+        }
+        
+        # Store metrics if provided
+        if metrics:
+            self.quality_metrics[curve_name] = metrics
+            
+            # Append metrics to status text
+            metrics_text = f"\nR² = {metrics.get('r_squared', 0):.4f}"
+            if 'reduced_chi_squared' in metrics:
+                metrics_text += f", χ²_red = {metrics['reduced_chi_squared']:.4f}"
+            if 'rms_error' in metrics:
+                metrics_text += f", RMS = {metrics['rms_error']:.4f} GPa"
+            
+            status_text += metrics_text
+        
+        # Update UI if status label exists
+        if hasattr(self, 'curve_entries'):
+            for entry in self.curve_entries:
+                if entry['name'].get() == curve_name and 'status_label' in entry:
+                    entry['status_label'].config(text=status_text, foreground=color)
+                    break
+
+    def import_eos_data_for_curve(self, curve_idx):
+        """Import main EOS data for curve fitting"""
+        curve_name = self.curve_entries[curve_idx]['name'].get()
+        
+        fname = filedialog.askopenfilename(
+            title=f"Import EOS Data for {curve_name}",
+            filetypes=[("Excel files", "*.xlsx"), ("Excel files", "*.xls")]
+        )
+        if not fname:
+            return
+            
+        try:
+            df = pd.read_excel(fname)
+            
+            # Check required columns
+            required_cols = {'P', 'V'}
+            missing_cols = required_cols - set(df.columns)
+            
+            if missing_cols:
+                messagebox.showerror(
+                    "Column Error", 
+                    f"Excel file must contain columns: {', '.join(required_cols)}\n"
+                    f"Missing columns: {', '.join(missing_cols)}\n\n"
+                    f"Optional columns: sigma_P, sigma_V (for uncertainties)"
+                )
+                return
+            
+            # Add default uncertainties if not present
+            if 'sigma_P' not in df.columns:
+                df['sigma_P'] = df['P'] * 0.01  # 1% default uncertainty
+            if 'sigma_V' not in df.columns:
+                df['sigma_V'] = df['V'] * 0.01  # 1% default uncertainty
+            
+            # Sort by pressure using smart_pressure_sort
+            sorted_data = smart_pressure_sort(df['P'].values, df['V'].values, 
+                                            df['sigma_P'].values, df['sigma_V'].values)
+            df_sorted = pd.DataFrame({
+                'P': sorted_data[0],
+                'V': sorted_data[1], 
+                'sigma_P': sorted_data[2],
+                'sigma_V': sorted_data[3]
+            })
+            
+            # Store in enhanced data system
+            self.eos_data[curve_name] = df_sorted
+            
+            # Update status
+            self.update_fitting_status(
+                curve_name, 
+                f"EOS Data: {len(df_sorted)} points loaded (P: {df_sorted['P'].min():.1f}-{df_sorted['P'].max():.1f} GPa)",
+                color="green"
+            )
+            
+            # Also store in old system for compatibility
+            self.curve_entries[curve_idx]['data_df'] = df_sorted
+            self.curve_entries[curve_idx]['data_status_label'].config(
+                text=f"EOS: {len(df_sorted)} points", 
+                foreground="green"
+            )
+            
+            messagebox.showinfo("Import Successful", 
+                              f"Loaded {len(df_sorted)} EOS data points for {curve_name}\n"
+                              f"Pressure range: {df_sorted['P'].min():.1f} - {df_sorted['P'].max():.1f} GPa\n"
+                              f"Data automatically sorted by pressure.")
+            
+        except Exception as e:
+            self.update_fitting_status(curve_name, f"EOS Data import failed: {str(e)}", color="red")
+            messagebox.showerror("Import Error", f"Failed to load EOS data:\n{str(e)}")
+
+    def import_error_data_for_curve(self, curve_idx):
+        """Import separate error data for error band calculations"""
+        curve_name = self.curve_entries[curve_idx]['name'].get()
+        
+        fname = filedialog.askopenfilename(
+            title=f"Import Error Data for {curve_name}",
+            filetypes=[("Excel files", "*.xlsx"), ("Excel files", "*.xls")]
+        )
+        if not fname:
+            return
+            
+        try:
+            df = pd.read_excel(fname)
+            
+            # Check required columns for error data
+            required_cols = {'P', 'V', 'sigma_P', 'sigma_V'}
+            missing_cols = required_cols - set(df.columns)
+            
+            if missing_cols:
+                messagebox.showerror(
+                    "Column Error", 
+                    f"Error data file must contain columns: {', '.join(required_cols)}\n"
+                    f"Missing columns: {', '.join(missing_cols)}"
+                )
+                return
+            
+            # Sort by pressure
+            sorted_data = smart_pressure_sort(df['P'].values, df['V'].values, 
+                                            df['sigma_P'].values, df['sigma_V'].values)
+            df_sorted = pd.DataFrame({
+                'P': sorted_data[0],
+                'V': sorted_data[1], 
+                'sigma_P': sorted_data[2],
+                'sigma_V': sorted_data[3]
+            })
+            
+            # Store error data separately
+            self.error_data[curve_name] = df_sorted
+            
+            # Update status
+            self.update_fitting_status(
+                curve_name, 
+                f"Error Data: {len(df_sorted)} points loaded",
+                color="blue"
+            )
+            
+            # Update UI
+            if 'error_status_label' in self.curve_entries[curve_idx]:
+                self.curve_entries[curve_idx]['error_status_label'].config(
+                    text=f"Error: {len(df_sorted)} points", 
+                    foreground="blue"
+                )
+            
+            messagebox.showinfo("Import Successful", 
+                              f"Loaded {len(df_sorted)} error data points for {curve_name}")
+            
+        except Exception as e:
+            self.update_fitting_status(curve_name, f"Error data import failed: {str(e)}", color="red")
+            messagebox.showerror("Import Error", f"Failed to load error data:\n{str(e)}")
+
+    def import_data_for_curve(self, curve_idx):
+        """Legacy data import function - redirects to enhanced EOS data import for compatibility"""
+        return self.import_eos_data_for_curve(curve_idx)
 
     # ---- Crystal UI (Updated for multi-lattice experimental data fitting) ----
     def setup_crystal_ui(self):
@@ -755,17 +1306,56 @@ class EOSPlotApp:
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to load data:\n{str(e)}")
 
-    def fit_eos_to_data(self, eos_type, data_df):
-        """Fit EOS to imported experimental data"""
-        V = data_df['V'].values
-        P = data_df['P'].values
-        sigma_P = data_df['sigma_P'].values
+    def fit_eos_to_data(self, eos_type, data_df, curve_name=None):
+        """Enhanced EOS fitting with robust algorithms and quality metrics"""
+        
+        # Use robust fitting algorithm
+        try:
+            # Update status
+            if curve_name:
+                self.update_fitting_status(curve_name, "Fitting EOS with robust algorithm...", color="orange")
+            
+            # Use robust fitting
+            result = robust_eos_fitting(
+                data_df['V'].values,
+                data_df['P'].values,
+                sigma_P=data_df['sigma_P'].values if 'sigma_P' in data_df.columns else None,
+                eos_type=eos_type
+            )
+            
+            # Update status with quality metrics
+            if curve_name:
+                self.update_fitting_status(
+                    curve_name, 
+                    f"Fitting successful ({result['successful_attempts']}/{result['fitting_attempts']} attempts)",
+                    metrics=result,
+                    color="green"
+                )
+            
+            # Return in old format for compatibility
+            return result['params'], result['covariance'], result['errors']
+            
+        except Exception as e:
+            # Fallback to original fitting method
+            if curve_name:
+                self.update_fitting_status(curve_name, f"Robust fitting failed, using fallback: {str(e)}", color="orange")
+            
+            return self._fit_eos_fallback(eos_type, data_df)
+
+    def _fit_eos_fallback(self, eos_type, data_df):
+        """Fallback fitting method (original algorithm)"""
+        # Sort data first
+        sorted_data = smart_pressure_sort(data_df['P'].values, data_df['V'].values, 
+                                        data_df['sigma_P'].values if 'sigma_P' in data_df.columns else None)
+        V = sorted_data[1]
+        P = sorted_data[0]
+        sigma_P = sorted_data[2] if len(sorted_data) > 2 and sorted_data[2] is not None else None
         
         # Choose EOS function
         if eos_type == 'Birch-Murnaghan':
-            eos_func = birch_murnaghan_P
+            eos_func = birch_murnaghan_fit_func
         else:  # Vinet
-            eos_func = vinet_P
+            eos_func = vinet_fit_func
             
         # Initial guess for parameters
         V0_guess = V.max()
@@ -774,12 +1364,21 @@ class EOSPlotApp:
         
         try:
             # Fit with experimental uncertainties
-            popt, pcov = curve_fit(
-                eos_func, V, P, 
-                p0=[V0_guess, K0_guess, Kp_guess],
-                sigma=sigma_P, 
-                absolute_sigma=True
-            )
+            if sigma_P is not None:
+                popt, pcov = curve_fit(
+                    eos_func, V, P, 
+                    p0=[V0_guess, K0_guess, Kp_guess],
+                    sigma=sigma_P, 
+                    absolute_sigma=True
+                )
+            else:
+                popt, pcov = curve_fit(
+                    eos_func, V, P, 
+                    p0=[V0_guess, K0_guess, Kp_guess]
+                )
+            
+            # Apply physical constraints
+            popt = apply_physical_constraints(popt, eos_type)
             
             # Calculate parameter uncertainties
             perr = np.sqrt(np.diag(pcov))
@@ -869,13 +1468,9 @@ class EOSPlotApp:
                         else:
                             p_noisy = p
                         
-                        # Calculate volume using inverse EOS
-                        sol = root_scalar(
-                            lambda V: eos_func(V, V0_s, K0_s, Kp_s) - p_noisy,
-                            bracket=[V0_s * 0.3, V0_s * 1.2],
-                            method='bisect'
-                        )
-                        vol = sol.root
+                        # Calculate volume using safe inverse EOS
+                        calc_result = safe_volume_calculation(eos_func, p_noisy, V0_s, K0_s, Kp_s)
+                        vol = calc_result['volume']
                         
                         # Add experimental volume noise if available
                         if has_exp_data and data_df is not None:
@@ -1144,20 +1739,35 @@ class EOSPlotApp:
                 return lambda e=None: lbl.config(text=EOS_EQUATIONS[var.get()])
             eos_cb.bind("<<ComboboxSelected>>", make_eos_cb_callback(eq_lbl, eos_var))
 
-            # Row 3: Data import section
-            data_frame = ttk.LabelFrame(grp, text="Data Import")
+            # Row 3: Enhanced Data import section
+            data_frame = ttk.LabelFrame(grp, text="Enhanced Data Import System")
             data_frame.grid(row=3, column=0, columnspan=6, sticky='ew', padx=5, pady=3)
             data_frame.columnconfigure(1, weight=1)
+            data_frame.columnconfigure(3, weight=1)
             
-            ttk.Button(data_frame, text="Import Excel", 
-                      command=lambda idx=i: self.import_data_for_curve(idx)).grid(row=0, column=0, padx=5, pady=3)
+            # EOS Data Import
+            ttk.Button(data_frame, text="Import EOS Data", 
+                      command=lambda idx=i: self.import_eos_data_for_curve(idx)).grid(row=0, column=0, padx=3, pady=3)
             
-            data_status_label = ttk.Label(data_frame, text="No data", foreground="gray", font=("Arial", 11))
-            data_status_label.grid(row=0, column=1, padx=8, pady=3, sticky='w')
+            data_status_label = ttk.Label(data_frame, text="No EOS data", foreground="gray", font=("Arial", 10))
+            data_status_label.grid(row=0, column=1, padx=5, pady=3, sticky='w')
             
+            # Error Data Import
+            ttk.Button(data_frame, text="Import Error Data", 
+                      command=lambda idx=i: self.import_error_data_for_curve(idx)).grid(row=0, column=2, padx=3, pady=3)
+            
+            error_status_label = ttk.Label(data_frame, text="No error data", foreground="gray", font=("Arial", 10))
+            error_status_label.grid(row=0, column=3, padx=5, pady=3, sticky='w')
+            
+            # Fitting options
             use_fitting_var = tk.BooleanVar(value=False)
             use_fitting_cb = ttk.Checkbutton(data_frame, text="Use for fitting", variable=use_fitting_var)
-            use_fitting_cb.grid(row=0, column=2, padx=5, pady=3)
+            use_fitting_cb.grid(row=1, column=0, padx=5, pady=3)
+            
+            # Status display for real-time metrics
+            status_label = ttk.Label(data_frame, text="Ready for data import", foreground="blue", 
+                                   font=("Arial", 10), wraplength=400)
+            status_label.grid(row=1, column=1, columnspan=3, padx=5, pady=3, sticky='w')
             
             # Row 4: EOS Parameters
             ttk.Label(grp, text="V₀ (Å³):", font=("Arial", 12)).grid(row=4, column=0, padx=5, sticky='w')
@@ -1229,6 +1839,8 @@ class EOSPlotApp:
                 'mc_samples': mc_samples, 'confidence': confidence,
                 'data_df': None,
                 'data_status_label': data_status_label,
+                'error_status_label': error_status_label,
+                'status_label': status_label,
                 'use_fitting': use_fitting_var
             })
             
@@ -1251,28 +1863,32 @@ class EOSPlotApp:
             else: widget.grid_remove()
 
     def calculate_error_band(self, P, V0, K0, Kp, V0_err, K0_err, Kp_err, eos_type):
-        """Simple error band calculation using parameter uncertainties"""
+        """Enhanced error band calculation using safe volume calculation"""
         # Generate multiple parameter sets using normal distribution
         n_samples = 100
         V0_samples = np.random.normal(V0, V0_err, n_samples)
         K0_samples = np.random.normal(K0, K0_err, n_samples)
         Kp_samples = np.random.normal(Kp, Kp_err, n_samples)
         
+        # Choose EOS function
+        if eos_type == 'Birch-Murnaghan':
+            eos_func = birch_murnaghan_P
+        else:
+            eos_func = vinet_P
+        
         # Calculate volumes for each parameter set
         volume_samples = []
         for i in range(n_samples):
             vols_i = []
             for p in P:
-                try:
-                    if eos_type == 'Birch-Murnaghan':
-                        sol = root_scalar(lambda V: birch_murnaghan_P(V, V0_samples[i], K0_samples[i], Kp_samples[i]) - p, 
-                                        bracket=[V0_samples[i]*0.5, V0_samples[i]*1.05], method='bisect')
-                    else:  # Vinet
-                        sol = root_scalar(lambda V: vinet_P(V, V0_samples[i], K0_samples[i], Kp_samples[i]) - p, 
-                                        bracket=[V0_samples[i]*0.5, V0_samples[i]*1.05], method='bisect')
-                    vols_i.append(sol.root)
-                except:
-                    vols_i.append(np.nan)
+                # Apply physical constraints to sampled parameters
+                constrained_params = apply_physical_constraints([V0_samples[i], K0_samples[i], Kp_samples[i]], eos_type)
+                V0_c, K0_c, Kp_c = constrained_params
+                
+                # Use safe volume calculation
+                calc_result = safe_volume_calculation(eos_func, p, V0_c, K0_c, Kp_c)
+                vols_i.append(calc_result['volume'])
+            
             volume_samples.append(vols_i)
         
         # Calculate percentiles for error band
@@ -1338,8 +1954,26 @@ class EOSPlotApp:
                         entry['K0_err'].delete(0, tk.END); entry['K0_err'].insert(0, f"{perr[1]:.2f}")
                         entry['Kp_err'].delete(0, tk.END); entry['Kp_err'].insert(0, f"{perr[2]:.3f}")
                     
-                    # Calculate fitted curve
-                    vols = np.array([root_scalar(lambda V, p=p: (birch_murnaghan_P(V,V0_fit,K0_fit,Kp_fit) if entry['eos'].get()== 'Birch-Murnaghan' else vinet_P(V,V0_fit,K0_fit,Kp_fit)) - p, bracket=[V0_fit*0.5,V0_fit*1.05],method='bisect').root for p in P])
+                    # Calculate fitted curve using safe volume calculation
+                    vols = []
+                    failed_calcs = 0
+                    for p in P:
+                        calc_result = safe_volume_calculation(
+                            birch_murnaghan_P if entry['eos'].get() == 'Birch-Murnaghan' else vinet_P,
+                            p, V0_fit, K0_fit, Kp_fit
+                        )
+                        vols.append(calc_result['volume'])
+                        if not calc_result['success']:
+                            failed_calcs += 1
+                    
+                    vols = np.array(vols)
+                    
+                    if failed_calcs > 0:
+                        self.update_fitting_status(
+                            name, 
+                            f"Fitting completed with {failed_calcs}/{len(P)} volume calculation warnings",
+                            color="orange"
+                        )
                     
                     # Store fitting results
                     data[f'{name}_fitted V0 (Å³)'] = [V0_fit] * len(P)
@@ -1351,13 +1985,27 @@ class EOSPlotApp:
                     
                 except Exception as e:
                     messagebox.showerror("Fitting Error", f"Failed to fit {name}: {str(e)}")
-                    # Fall back to manual parameters
+                    # Fall back to manual parameters with safe calculation
                     V0,K0,Kp=float(entry['V0'].get()),float(entry['K0'].get()),float(entry['Kp'].get())
-                    vols=np.array([root_scalar(lambda V, p=p, V0=V0, K0=K0, Kp=Kp: (birch_murnaghan_P(V,V0,K0,Kp) if entry['eos'].get()== 'Birch-Murnaghan' else vinet_P(V,V0,K0,Kp)) - p, bracket=[V0*0.5,V0*1.05],method='bisect').root for p in P])
+                    vols = []
+                    for p in P:
+                        calc_result = safe_volume_calculation(
+                            birch_murnaghan_P if entry['eos'].get() == 'Birch-Murnaghan' else vinet_P,
+                            p, V0, K0, Kp
+                        )
+                        vols.append(calc_result['volume'])
+                    vols = np.array(vols)
             else:
-                # Use manual parameters
+                # Use manual parameters with safe calculation
                 V0,K0,Kp=float(entry['V0'].get()),float(entry['K0'].get()),float(entry['Kp'].get())
-                vols=np.array([root_scalar(lambda V, p=p, V0=V0, K0=K0, Kp=Kp: (birch_murnaghan_P(V,V0,K0,Kp) if entry['eos'].get()== 'Birch-Murnaghan' else vinet_P(V,V0,K0,Kp)) - p, bracket=[V0*0.5,V0*1.05],method='bisect').root for p in P])
+                vols = []
+                for p in P:
+                    calc_result = safe_volume_calculation(
+                        birch_murnaghan_P if entry['eos'].get() == 'Birch-Murnaghan' else vinet_P,
+                        p, V0, K0, Kp
+                    )
+                    vols.append(calc_result['volume'])
+                vols = np.array(vols)
             
             data[f'{name} Volume (Å³)'] = vols
             
