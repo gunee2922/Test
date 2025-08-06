@@ -1,0 +1,29 @@
+# Test files and sample data
+test_eos_enhanced.py
+verify_eos_enhanced.py
+create_sample_data.py
+sample_*.xlsx
+README_ENHANCED.md
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# Logs
+*.log
